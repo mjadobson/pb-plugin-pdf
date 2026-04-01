@@ -1,4 +1,4 @@
-module github.com/matthewdobson/pb-plugin-pdf
+module github.com/mjadobson/pb-plugin-pdf
 
 go 1.25.0
 
