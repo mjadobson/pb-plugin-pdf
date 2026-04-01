@@ -53,10 +53,6 @@ func (p *Plugin) Init(app core.App) error {
 		return err
 	}
 
-	if err := p.validateStartupConfigs(app); err != nil {
-		return err
-	}
-
 	for _, cfg := range p.Configs {
 		config := cfg
 
