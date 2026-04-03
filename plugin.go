@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -23,6 +24,7 @@ var version = "dev"
 var extractText = pdfToText
 
 const extractionInProgressKey = "@pdf_text_extractor_in_progress"
+const inputChangedKeyPrefix = "@pdf_text_extractor_input_changed:"
 const pluginsCollectionName = "_plugins"
 const pluginNameField = "plugin_name"
 const configField = "config"
@@ -97,6 +99,11 @@ func (p *Plugin) Init(app core.App) error {
 		return e.Next()
 	})
 
+	app.OnRecordUpdate().BindFunc(func(e *core.RecordEvent) error {
+		p.markChangedInputFields(e)
+		return e.Next()
+	})
+
 	app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if err := p.handleRecordEvent(e); err != nil {
 			e.App.Logger().Error(
@@ -155,6 +162,10 @@ func (p *Plugin) handleRecordEvent(e *core.RecordEvent) error {
 	var errs []error
 
 	for _, cfg := range configs {
+		if e.Type == "update" && !didInputFieldChange(e.Record, cfg.InputField) {
+			continue
+		}
+
 		if err := processRecord(e.Context, e.App, cfg, e.Record); err != nil {
 			errs = append(errs, err)
 			e.App.Logger().Error(
@@ -169,6 +180,37 @@ func (p *Plugin) handleRecordEvent(e *core.RecordEvent) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (p *Plugin) markChangedInputFields(e *core.RecordEvent) {
+	if p.state == nil || e.Record.Collection().Name == pluginsCollectionName {
+		return
+	}
+
+	configs := p.state.configsForCollection(e.Record.Collection().Name)
+	if len(configs) == 0 {
+		return
+	}
+
+	oldRecord, err := e.App.FindRecordById(e.Record.Collection(), e.Record.Id)
+	if err != nil {
+		for _, cfg := range configs {
+			e.Record.SetRaw(inputChangedKeyPrefix+cfg.InputField, true)
+		}
+		return
+	}
+
+	for _, cfg := range configs {
+		e.Record.SetRaw(
+			inputChangedKeyPrefix+cfg.InputField,
+			!slices.Equal(oldRecord.GetStringSlice(cfg.InputField), e.Record.GetStringSlice(cfg.InputField)),
+		)
+	}
+}
+
+func didInputFieldChange(record *core.Record, fieldName string) bool {
+	changed, _ := record.GetRaw(inputChangedKeyPrefix + fieldName).(bool)
+	return changed
 }
 
 func (p *Plugin) refreshState(app core.App) error {

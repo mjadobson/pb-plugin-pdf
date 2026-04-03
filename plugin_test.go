@@ -252,6 +252,51 @@ func TestPluginPocketBaseIntegrationWithPluginsTable(t *testing.T) {
 	}
 }
 
+func TestPluginSkipsUnrelatedUpdates(t *testing.T) {
+	app := newTestApp(t)
+	docs := createDocsCollection(t, app)
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	createPluginConfigRecord(t, app, true, []ExtractPdfTextConfig{
+		{
+			CollectionName: docs.Name,
+			InputField:     "pdfs",
+			OutputField:    "extracted_text",
+		},
+	})
+
+	record := createRecordWithPDF(t, app, docs)
+	expectedSingle := expectedFixtureText(t)
+
+	originalExtract := extractText
+	t.Cleanup(func() {
+		extractText = originalExtract
+	})
+
+	calls := 0
+	extractText = func(path string) (string, error) {
+		calls++
+		return originalExtract(path)
+	}
+
+	record.Set("title", "bulk edit should not reparse pdfs")
+	if err := app.Save(record); err != nil {
+		t.Fatalf("failed to save unrelated record update: %v", err)
+	}
+
+	if calls != 0 {
+		t.Fatalf("expected unrelated update to skip pdf extraction, got %d extraction calls", calls)
+	}
+
+	if got := record.GetString("extracted_text"); got != expectedSingle {
+		t.Fatalf("unexpected extracted text after unrelated update:\n got: %q\nwant: %q", got, expectedSingle)
+	}
+}
+
 func TestPluginReloadsWhenConfigRowsChange(t *testing.T) {
 	app := newTestApp(t)
 	docs := createDocsCollection(t, app)
@@ -401,6 +446,7 @@ func createDocsCollection(t *testing.T, app *core.BaseApp) *core.Collection {
 	collection := core.NewBaseCollection("docs")
 	collection.Fields.Add(
 		&core.FileField{Name: "pdfs", MaxSelect: 10},
+		&core.TextField{Name: "title"},
 		&core.TextField{Name: "extracted_text"},
 	)
 

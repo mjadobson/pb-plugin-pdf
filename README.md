@@ -51,7 +51,7 @@ For each configured rule, make sure the target collection has:
 - a file field matching `input_field`
 - a text or editor field matching `output_field`
 
-The plugin runs after successful record create and update operations.
+The plugin runs after successful record creation, and after updates only when the configured file field value changes.
 
 ## Plugin Config
 
@@ -74,6 +74,7 @@ The text or editor field where extracted content should be stored.
 - Non-PDF files are ignored.
 - Multiple PDFs are joined with `---` on its own line.
 - Extraction failures are logged and skipped so other files can still be processed.
+- Unrelated record updates do not re-parse PDFs; text is refreshed only when the configured file field changes.
 - Changing `_plugins` rows or relevant collection schemas takes effect for future create/update events without backfilling existing records.
 
 ## Development
