@@ -14,7 +14,8 @@ xpb build --with github.com/matthewdobson/pb-plugin-pdf@latest
 
 ## Setup
 
-On startup, the plugin creates a shared `_plugins` collection if it doesn't already exist.
+During app initialization, the plugin creates a shared `_plugins` collection if it doesn't already exist.
+If the plugin is loaded before PocketBase has finished bootstrapping, this setup is deferred until the bootstrap step completes.
 
 The collection includes these fields:
 

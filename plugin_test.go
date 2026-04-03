@@ -117,6 +117,45 @@ func TestInitCreatesPluginsCollection(t *testing.T) {
 	}
 }
 
+func TestInitBeforeBootstrapDefersCollectionSetupUntilBootstrap(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "pb_data")
+	app := core.NewBaseApp(core.BaseAppConfig{
+		DataDir: dataDir,
+	})
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin before bootstrap: %v", err)
+	}
+
+	if app.IsBootstrapped() {
+		t.Fatal("did not expect app to be bootstrapped yet")
+	}
+
+	if err := app.Bootstrap(); err != nil {
+		t.Fatalf("failed to bootstrap pocketbase app: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := app.ResetBootstrapState(); err != nil {
+			t.Fatalf("failed to reset pocketbase app: %v", err)
+		}
+
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Fatalf("failed to remove pocketbase data dir: %v", err)
+		}
+	})
+
+	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+	if err != nil {
+		t.Fatalf("expected %s collection to exist after bootstrap: %v", pluginsCollectionName, err)
+	}
+
+	if err := validatePluginsCollection(collection); err != nil {
+		t.Fatalf("unexpected %s validation error after bootstrap: %v", pluginsCollectionName, err)
+	}
+}
+
 func TestPluginLoadsConfigRowsForMissingCollectionsWithoutFailing(t *testing.T) {
 	app := newTestApp(t)
 

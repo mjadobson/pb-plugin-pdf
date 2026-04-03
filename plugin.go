@@ -70,8 +70,18 @@ func (p *Plugin) Description() string {
 func (p *Plugin) Init(app core.App) error {
 	p.state = newPluginState(p.Name())
 
-	if err := p.refreshState(app); err != nil {
-		return err
+	if app.IsBootstrapped() {
+		if err := p.refreshState(app); err != nil {
+			return err
+		}
+	} else {
+		app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+			if err := e.Next(); err != nil {
+				return err
+			}
+
+			return p.refreshState(e.App)
+		})
 	}
 
 	app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
