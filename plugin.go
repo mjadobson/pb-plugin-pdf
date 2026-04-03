@@ -2,12 +2,14 @@ package pdf_text_extractor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/moolekkari/unipdf/extractor"
 	pdf "github.com/moolekkari/unipdf/model"
@@ -21,6 +23,10 @@ var version = "dev"
 var extractText = pdfToText
 
 const extractionInProgressKey = "@pdf_text_extractor_in_progress"
+const pluginsCollectionName = "_plugins"
+const pluginNameField = "plugin_name"
+const configField = "config"
+const enabledField = "enabled"
 
 type ExtractPdfTextConfig struct {
 	CollectionName string `json:"collection_name"`
@@ -29,7 +35,20 @@ type ExtractPdfTextConfig struct {
 }
 
 type Plugin struct {
-	Configs []ExtractPdfTextConfig `json:"configs"`
+	state *pluginState
+}
+
+type pluginState struct {
+	pluginName string
+	mu         sync.RWMutex
+	byColl     map[string][]ExtractPdfTextConfig
+}
+
+func newPluginState(pluginName string) *pluginState {
+	return &pluginState{
+		pluginName: pluginName,
+		byColl:     map[string][]ExtractPdfTextConfig{},
+	}
 }
 
 func init() {
@@ -49,73 +68,260 @@ func (p *Plugin) Description() string {
 }
 
 func (p *Plugin) Init(app core.App) error {
-	if err := p.validateConfigShapes(); err != nil {
+	p.state = newPluginState(p.Name())
+
+	if err := p.refreshState(app); err != nil {
 		return err
 	}
 
-	for _, cfg := range p.Configs {
-		config := cfg
+	app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if err := p.handleRecordEvent(e); err != nil {
+			e.App.Logger().Error(
+				"pdf_text_extractor create hook failed",
+				slog.String("collection", e.Record.Collection().Name),
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
 
-		app.OnRecordAfterCreateSuccess(config.CollectionName).BindFunc(func(e *core.RecordEvent) error {
-			if err := processRecord(e.Context, e.App, config, e.Record); err != nil {
-				e.App.Logger().Error(
-					"pdf_text_extractor create hook failed",
-					slog.String("collection", config.CollectionName),
-					slog.String("recordId", e.Record.Id),
-					slog.Any("error", err),
-				)
-			}
+		return e.Next()
+	})
 
-			return e.Next()
-		})
+	app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if err := p.handleRecordEvent(e); err != nil {
+			e.App.Logger().Error(
+				"pdf_text_extractor update hook failed",
+				slog.String("collection", e.Record.Collection().Name),
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
 
-		app.OnRecordAfterUpdateSuccess(config.CollectionName).BindFunc(func(e *core.RecordEvent) error {
-			if err := processRecord(e.Context, e.App, config, e.Record); err != nil {
-				e.App.Logger().Error(
-					"pdf_text_extractor update hook failed",
-					slog.String("collection", config.CollectionName),
-					slog.String("recordId", e.Record.Id),
-					slog.Any("error", err),
-				)
-			}
+		return e.Next()
+	})
 
-			return e.Next()
-		})
+	refreshConfigs := func(e *core.RecordEvent) error {
+		if err := p.refreshState(e.App); err != nil {
+			e.App.Logger().Error(
+				"pdf_text_extractor config reload failed",
+				slog.String("collection", e.Record.Collection().Name),
+				slog.String("recordId", e.Record.Id),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
 	}
+
+	app.OnRecordAfterCreateSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+	app.OnRecordAfterUpdateSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+	app.OnRecordAfterDeleteSuccess(pluginsCollectionName).BindFunc(refreshConfigs)
+
+	refreshOnCollectionChange := func(e *core.CollectionEvent) error {
+		if err := p.refreshState(e.App); err != nil {
+			e.App.Logger().Error(
+				"pdf_text_extractor config reload failed",
+				slog.String("collection", e.Collection.Name),
+				slog.Any("error", err),
+			)
+		}
+
+		return e.Next()
+	}
+
+	app.OnCollectionAfterCreateSuccess().BindFunc(refreshOnCollectionChange)
+	app.OnCollectionAfterUpdateSuccess().BindFunc(refreshOnCollectionChange)
+	app.OnCollectionAfterDeleteSuccess().BindFunc(refreshOnCollectionChange)
 
 	return nil
 }
 
-func (p *Plugin) validateConfigShapes() error {
-	if len(p.Configs) == 0 {
-		return fmt.Errorf("%s: at least one config entry is required", p.Name())
+func (p *Plugin) handleRecordEvent(e *core.RecordEvent) error {
+	if p.state == nil || e.Record.Collection().Name == pluginsCollectionName {
+		return nil
 	}
 
-	for i, cfg := range p.Configs {
-		if cfg.CollectionName == "" || cfg.InputField == "" || cfg.OutputField == "" {
-			return fmt.Errorf("%s: config %d must include collection_name, input_field, and output_field", p.Name(), i)
+	configs := p.state.configsForCollection(e.Record.Collection().Name)
+	var errs []error
+
+	for _, cfg := range configs {
+		if err := processRecord(e.Context, e.App, cfg, e.Record); err != nil {
+			errs = append(errs, err)
+			e.App.Logger().Error(
+				"pdf_text_extractor config processing failed",
+				slog.String("collection", cfg.CollectionName),
+				slog.String("recordId", e.Record.Id),
+				slog.String("inputField", cfg.InputField),
+				slog.String("outputField", cfg.OutputField),
+				slog.Any("error", err),
+			)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
-func (p *Plugin) validateStartupConfigs(app core.App) error {
-	for i, cfg := range p.Configs {
-		collection, err := app.FindCachedCollectionByNameOrId(cfg.CollectionName)
+func (p *Plugin) refreshState(app core.App) error {
+	if err := ensurePluginsCollection(app); err != nil {
+		return err
+	}
+
+	return p.state.reload(app)
+}
+
+func (s *pluginState) reload(app core.App) error {
+	rows, err := app.FindAllRecords(
+		pluginsCollectionName,
+		dbx.HashExp{
+			pluginNameField: s.pluginName,
+			enabledField:    true,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("load plugin configs: %w", err)
+	}
+
+	next := make(map[string][]ExtractPdfTextConfig)
+
+	for _, row := range rows {
+		cfgs, err := parsePluginConfigs(row)
 		if err != nil {
-			app.Logger().Warn(
-				"pdf_text_extractor config warning",
-				slog.Int("configIndex", i),
-				slog.String("collection", cfg.CollectionName),
-				slog.Any("error", fmt.Errorf("collection %q not found yet: %w", cfg.CollectionName, err)),
+			app.Logger().Error(
+				"pdf_text_extractor invalid config row",
+				slog.String("recordId", row.Id),
+				slog.Any("error", err),
 			)
 			continue
 		}
 
-		if err := validateConfigForCollection(cfg, collection); err != nil {
-			return fmt.Errorf("%s: config %d invalid: %w", p.Name(), i, err)
+		for i, cfg := range cfgs {
+			if err := validateConfigShape(cfg); err != nil {
+				app.Logger().Error(
+					"pdf_text_extractor invalid config entry",
+					slog.String("recordId", row.Id),
+					slog.Int("configIndex", i),
+					slog.Any("error", err),
+				)
+				continue
+			}
+
+			collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
+			if err != nil {
+				app.Logger().Warn(
+					"pdf_text_extractor config warning",
+					slog.String("recordId", row.Id),
+					slog.String("collection", cfg.CollectionName),
+					slog.Any("error", fmt.Errorf("collection %q not found yet: %w", cfg.CollectionName, err)),
+				)
+				next[cfg.CollectionName] = append(next[cfg.CollectionName], cfg)
+				continue
+			}
+
+			if err := validateConfigForCollection(cfg, collection); err != nil {
+				app.Logger().Error(
+					"pdf_text_extractor invalid collection config",
+					slog.String("recordId", row.Id),
+					slog.Int("configIndex", i),
+					slog.String("collection", cfg.CollectionName),
+					slog.Any("error", err),
+				)
+				continue
+			}
+
+			next[cfg.CollectionName] = append(next[cfg.CollectionName], cfg)
 		}
+	}
+
+	s.mu.Lock()
+	s.byColl = next
+	s.mu.Unlock()
+
+	return nil
+}
+
+func (s *pluginState) configsForCollection(collectionName string) []ExtractPdfTextConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	configs := s.byColl[collectionName]
+	if len(configs) == 0 {
+		return nil
+	}
+
+	cloned := make([]ExtractPdfTextConfig, len(configs))
+	copy(cloned, configs)
+	return cloned
+}
+
+func ensurePluginsCollection(app core.App) error {
+	collection, err := app.FindCollectionByNameOrId(pluginsCollectionName)
+	if err == nil {
+		return validatePluginsCollection(collection)
+	}
+
+	collection = core.NewBaseCollection(pluginsCollectionName)
+	collection.Fields.Add(
+		&core.TextField{Name: pluginNameField, Required: true},
+		&core.JSONField{Name: configField, Required: true},
+		&core.BoolField{Name: enabledField},
+	)
+
+	if err := app.Save(collection); err != nil {
+		return fmt.Errorf("create %s collection: %w", pluginsCollectionName, err)
+	}
+
+	return nil
+}
+
+func validatePluginsCollection(collection *core.Collection) error {
+	pluginName := collection.Fields.GetByName(pluginNameField)
+	if pluginName == nil {
+		return fmt.Errorf("%s collection missing %q field", pluginsCollectionName, pluginNameField)
+	}
+	if _, ok := pluginName.(*core.TextField); !ok {
+		return fmt.Errorf("%s.%s must be a text field", pluginsCollectionName, pluginNameField)
+	}
+
+	config := collection.Fields.GetByName(configField)
+	if config == nil {
+		return fmt.Errorf("%s collection missing %q field", pluginsCollectionName, configField)
+	}
+	if _, ok := config.(*core.JSONField); !ok {
+		return fmt.Errorf("%s.%s must be a json field", pluginsCollectionName, configField)
+	}
+
+	enabled := collection.Fields.GetByName(enabledField)
+	if enabled == nil {
+		return fmt.Errorf("%s collection missing %q field", pluginsCollectionName, enabledField)
+	}
+	if _, ok := enabled.(*core.BoolField); !ok {
+		return fmt.Errorf("%s.%s must be a bool field", pluginsCollectionName, enabledField)
+	}
+
+	return nil
+}
+
+func parsePluginConfigs(row *core.Record) ([]ExtractPdfTextConfig, error) {
+	raw, ok := row.GetRaw(configField).(types.JSONRaw)
+	if !ok {
+		return nil, fmt.Errorf("config field is not json")
+	}
+
+	var configs []ExtractPdfTextConfig
+	if err := json.Unmarshal(raw, &configs); err != nil {
+		return nil, fmt.Errorf("decode config json: %w", err)
+	}
+
+	if len(configs) == 0 {
+		return nil, errors.New("config must include at least one entry")
+	}
+
+	return configs, nil
+}
+
+func validateConfigShape(cfg ExtractPdfTextConfig) error {
+	if cfg.CollectionName == "" || cfg.InputField == "" || cfg.OutputField == "" {
+		return errors.New("config must include collection_name, input_field, and output_field")
 	}
 
 	return nil
@@ -245,24 +451,7 @@ func updateOutputField(ctx context.Context, app core.App, record *core.Record, o
 	record.Set(outputField, content)
 	record.Set("updated", types.NowDateTime())
 
-	if err := app.SaveNoValidateWithContext(ctx, record); err != nil {
-		// Best-effort fallback to keep extraction functional even if a nested save is blocked.
-		_, dbErr := app.DB().
-			Update(
-				record.TableName(),
-				dbx.Params{
-					outputField: content,
-					"updated":   record.GetDateTime("updated"),
-				},
-				dbx.HashExp{"id": record.Id},
-			).
-			Execute()
-		if dbErr != nil {
-			return errors.Join(err, dbErr)
-		}
-	}
-
-	return nil
+	return app.SaveNoValidateWithContext(ctx, record)
 }
 
 func pdfToText(inputPath string) (string, error) {

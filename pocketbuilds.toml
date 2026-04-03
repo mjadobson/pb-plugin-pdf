@@ -1,6 +1,0 @@
-[pdf_text_extractor]
-
-[[pdf_text_extractor.configs]]
-collection_name = "docs"
-input_field = "pdfs"
-output_field = "extracted_text"

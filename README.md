@@ -14,46 +14,57 @@ xpb build --with github.com/matthewdobson/pb-plugin-pdf@latest
 
 ## Setup
 
-Add the plugin config to your `pocketbuilds.toml`:
+On startup, the plugin creates a shared `_plugins` collection if it doesn't already exist.
 
-```toml
-[pdf_text_extractor]
+The collection includes these fields:
 
-[[pdf_text_extractor.configs]]
-collection_name = "docs"
-input_field = "files"
-output_field = "files_text"
+- `plugin_name` (`text`)
+- `config` (`json`)
+- `enabled` (`bool`)
 
-[[pdf_text_extractor.configs]]
-collection_name = "invoices"
-input_field = "pdf"
-output_field = "pdf_text"
+To configure this plugin, add a row to `_plugins` with:
+
+- `plugin_name` = `pdf_text_extractor`
+- `enabled` = `true`
+- `config` containing a JSON array of extraction rules
+
+Example:
+
+```json
+[
+  {
+    "collection_name": "docs",
+    "input_field": "files",
+    "output_field": "files_text"
+  },
+  {
+    "collection_name": "invoices",
+    "input_field": "pdf",
+    "output_field": "pdf_text"
+  }
+]
 ```
 
-Then make sure your collection has:
+For each configured rule, make sure the target collection has:
 
 - a file field matching `input_field`
-- a text field matching `output_field`
+- a text or editor field matching `output_field`
 
 The plugin runs after successful record create and update operations.
 
 ## Plugin Config
 
-### `configs`
-
-An array of extraction rules.
-
-### `configs[].collection_name`
+### `config[].collection_name`
 
 The PocketBase collection name to watch.
 
-### `configs[].input_field`
+### `config[].input_field`
 
 The file field containing one or more uploads.
 
-### `configs[].output_field`
+### `config[].output_field`
 
-The text field where extracted content should be stored.
+The text or editor field where extracted content should be stored.
 
 ## Behaviour
 
@@ -62,6 +73,7 @@ The text field where extracted content should be stored.
 - Non-PDF files are ignored.
 - Multiple PDFs are joined with `---` on its own line.
 - Extraction failures are logged and skipped so other files can still be processed.
+- Changing `_plugins` rows or relevant collection schemas takes effect for future create/update events without backfilling existing records.
 
 ## Development
 
