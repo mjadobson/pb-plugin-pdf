@@ -201,16 +201,21 @@ func (p *Plugin) markChangedInputFields(e *core.RecordEvent) {
 	}
 
 	for _, cfg := range configs {
-		e.Record.SetRaw(
-			inputChangedKeyPrefix+cfg.InputField,
-			!slices.Equal(oldRecord.GetStringSlice(cfg.InputField), e.Record.GetStringSlice(cfg.InputField)),
-		)
+		e.Record.SetRaw(inputChangedKeyPrefix+cfg.InputField, didInputFieldChangeBeforeSave(oldRecord, e.Record, cfg.InputField))
 	}
 }
 
 func didInputFieldChange(record *core.Record, fieldName string) bool {
 	changed, _ := record.GetRaw(inputChangedKeyPrefix + fieldName).(bool)
 	return changed
+}
+
+func didInputFieldChangeBeforeSave(oldRecord *core.Record, record *core.Record, fieldName string) bool {
+	if len(record.GetUnsavedFiles(fieldName)) > 0 {
+		return true
+	}
+
+	return !slices.Equal(oldRecord.GetStringSlice(fieldName), record.GetStringSlice(fieldName))
 }
 
 func (p *Plugin) refreshState(app core.App) error {

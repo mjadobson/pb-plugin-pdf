@@ -297,6 +297,60 @@ func TestPluginSkipsUnrelatedUpdates(t *testing.T) {
 	}
 }
 
+func TestPluginProcessesUpdateWhenAddingFirstPDFToEmptyField(t *testing.T) {
+	app := newTestApp(t)
+	docs := createDocsCollection(t, app)
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	createPluginConfigRecord(t, app, true, []ExtractPdfTextConfig{
+		{
+			CollectionName: docs.Name,
+			InputField:     "pdfs",
+			OutputField:    "extracted_text",
+		},
+	})
+
+	record := core.NewRecord(docs)
+	record.Set("title", "starts empty")
+
+	if err := app.Save(record); err != nil {
+		t.Fatalf("failed to save empty record: %v", err)
+	}
+
+	if got := record.GetString("extracted_text"); got != "" {
+		t.Fatalf("expected empty create to skip extraction, got %q", got)
+	}
+
+	pdfFile, err := filesystem.NewFileFromPath(filepath.Join("testdata", "dummy.pdf"))
+	if err != nil {
+		t.Fatalf("failed to create file upload from fixture: %v", err)
+	}
+
+	record.Set("pdfs+", []any{pdfFile})
+
+	if err := app.Save(record); err != nil {
+		t.Fatalf("failed to save record after adding first pdf: %v", err)
+	}
+
+	expectedSingle := expectedFixtureText(t)
+	if got := record.GetString("extracted_text"); got != expectedSingle {
+		t.Fatalf("expected update to process first added pdf:\n got: %q\nwant: %q", got, expectedSingle)
+	}
+
+	reloaded, err := app.FindRecordById(docs, record.Id)
+	if err != nil {
+		t.Fatalf("failed to reload updated record: %v", err)
+	}
+
+	if got := reloaded.GetString("extracted_text"); got != expectedSingle {
+		t.Fatalf("unexpected extracted text after adding first pdf:\n got: %q\nwant: %q", got, expectedSingle)
+	}
+}
+
 func TestPluginReloadsWhenConfigRowsChange(t *testing.T) {
 	app := newTestApp(t)
 	docs := createDocsCollection(t, app)
