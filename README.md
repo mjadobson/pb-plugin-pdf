@@ -9,7 +9,7 @@ The plugin supports multi-file fields, ignores non-PDF uploads, and merges multi
 Build PocketBase with the plugin:
 
 ```sh
-xpb build --with github.com/matthewdobson/pb-plugin-pdf@latest
+xpb build --with github.com/mjadobson/pb-plugin-pdf@latest
 ```
 
 ## Setup
