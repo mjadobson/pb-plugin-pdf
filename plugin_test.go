@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/filesystem"
@@ -429,6 +430,103 @@ func TestPluginReloadsWhenConfigRowsChange(t *testing.T) {
 	}
 }
 
+func TestPluginRecalculatesExistingRowsWhenRequestedInConfig(t *testing.T) {
+	app := newTestApp(t)
+	docs := createDocsCollection(t, app)
+
+	p := &Plugin{}
+	if err := p.Init(app); err != nil {
+		t.Fatalf("failed to init plugin: %v", err)
+	}
+
+	configRow := createPluginConfigRecord(t, app, false, []ExtractPdfTextConfig{
+		{
+			CollectionName: docs.Name,
+			InputField:     "pdfs",
+			OutputField:    "extracted_text",
+		},
+	})
+
+	record1 := createRecordWithPDF(t, app, docs)
+	record2 := createRecordWithPDF(t, app, docs)
+
+	if got := record1.GetString("extracted_text"); got != "" {
+		t.Fatalf("expected disabled config to skip extraction, got %q", got)
+	}
+	if got := record2.GetString("extracted_text"); got != "" {
+		t.Fatalf("expected disabled config to skip extraction, got %q", got)
+	}
+
+	originalExtract := extractText
+	t.Cleanup(func() {
+		extractText = originalExtract
+	})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	extractText = func(path string) (string, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return originalExtract(path)
+	}
+
+	configs := mustParsePluginConfigs(t, configRow)
+	configs[0].Recalculate = true
+	setPluginConfigs(t, configRow, configs)
+	configRow.Set(enabledField, true)
+	if err := app.Save(configRow); err != nil {
+		t.Fatalf("failed to request recalculation: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for recalculation to start")
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		row, err := app.FindRecordById(pluginsCollectionName, configRow.Id)
+		if err != nil {
+			return false
+		}
+
+		cfgs := mustParsePluginConfigs(t, row)
+		return len(cfgs) == 1 && !cfgs[0].Recalculate && cfgs[0].Recalculating
+	})
+
+	close(release)
+
+	waitFor(t, 5*time.Second, func() bool {
+		row, err := app.FindRecordById(pluginsCollectionName, configRow.Id)
+		if err != nil {
+			return false
+		}
+
+		cfgs := mustParsePluginConfigs(t, row)
+		return len(cfgs) == 1 && !cfgs[0].Recalculate && !cfgs[0].Recalculating
+	})
+
+	expectedSingle := expectedFixtureText(t)
+
+	waitFor(t, 5*time.Second, func() bool {
+		reloaded1, err := app.FindRecordById(docs, record1.Id)
+		if err != nil {
+			return false
+		}
+
+		reloaded2, err := app.FindRecordById(docs, record2.Id)
+		if err != nil {
+			return false
+		}
+
+		return reloaded1.GetString("extracted_text") == expectedSingle &&
+			reloaded2.GetString("extracted_text") == expectedSingle
+	})
+}
+
 func TestPluginReloadsWhenCollectionsChange(t *testing.T) {
 	app := newTestApp(t)
 
@@ -577,6 +675,42 @@ func jsonRaw(v any) (types.JSONRaw, error) {
 	}
 
 	return types.JSONRaw(bytes), nil
+}
+
+func mustParsePluginConfigs(t *testing.T, row *core.Record) []ExtractPdfTextConfig {
+	t.Helper()
+
+	cfgs, err := parsePluginConfigs(row)
+	if err != nil {
+		t.Fatalf("failed to parse plugin configs: %v", err)
+	}
+
+	return cfgs
+}
+
+func setPluginConfigs(t *testing.T, row *core.Record, configs []ExtractPdfTextConfig) {
+	t.Helper()
+
+	raw, err := jsonRaw(configs)
+	if err != nil {
+		t.Fatalf("failed to encode config json: %v", err)
+	}
+
+	row.Set(configField, raw)
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for condition")
 }
 
 func newTestApp(t *testing.T) *core.BaseApp {

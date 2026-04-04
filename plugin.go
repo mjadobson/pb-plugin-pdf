@@ -29,11 +29,14 @@ const pluginsCollectionName = "_plugins"
 const pluginNameField = "plugin_name"
 const configField = "config"
 const enabledField = "enabled"
+const recalculateBatchSize = 100
 
 type ExtractPdfTextConfig struct {
 	CollectionName string `json:"collection_name"`
 	InputField     string `json:"input_field"`
 	OutputField    string `json:"output_field"`
+	Recalculate    bool   `json:"recalculate,omitempty"`
+	Recalculating  bool   `json:"recalculating,omitempty"`
 }
 
 type Plugin struct {
@@ -41,16 +44,24 @@ type Plugin struct {
 }
 
 type pluginState struct {
-	pluginName string
-	mu         sync.RWMutex
-	byColl     map[string][]ExtractPdfTextConfig
+	pluginName           string
+	mu                   sync.RWMutex
+	byColl               map[string][]ExtractPdfTextConfig
+	activeRecalculations map[string]struct{}
 }
 
 func newPluginState(pluginName string) *pluginState {
 	return &pluginState{
-		pluginName: pluginName,
-		byColl:     map[string][]ExtractPdfTextConfig{},
+		pluginName:           pluginName,
+		byColl:               map[string][]ExtractPdfTextConfig{},
+		activeRecalculations: map[string]struct{}{},
 	}
+}
+
+type pendingRecalculation struct {
+	rowID       string
+	configIndex int
+	config      ExtractPdfTextConfig
 }
 
 func init() {
@@ -223,10 +234,19 @@ func (p *Plugin) refreshState(app core.App) error {
 		return err
 	}
 
-	return p.state.reload(app)
+	pending, err := p.state.reload(app)
+	if err != nil {
+		return err
+	}
+
+	for _, job := range pending {
+		go p.runRecalculation(app, job)
+	}
+
+	return nil
 }
 
-func (s *pluginState) reload(app core.App) error {
+func (s *pluginState) reload(app core.App) ([]pendingRecalculation, error) {
 	rows, err := app.FindAllRecords(
 		pluginsCollectionName,
 		dbx.HashExp{
@@ -235,10 +255,11 @@ func (s *pluginState) reload(app core.App) error {
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("load plugin configs: %w", err)
+		return nil, fmt.Errorf("load plugin configs: %w", err)
 	}
 
 	next := make(map[string][]ExtractPdfTextConfig)
+	pending := make([]pendingRecalculation, 0)
 
 	for _, row := range rows {
 		cfgs, err := parsePluginConfigs(row)
@@ -260,6 +281,16 @@ func (s *pluginState) reload(app core.App) error {
 					slog.Any("error", err),
 				)
 				continue
+			}
+
+			if cfg.Recalculate {
+				if s.tryStartRecalculation(row.Id, i) {
+					pending = append(pending, pendingRecalculation{
+						rowID:       row.Id,
+						configIndex: i,
+						config:      cfg,
+					})
+				}
 			}
 
 			collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
@@ -293,7 +324,7 @@ func (s *pluginState) reload(app core.App) error {
 	s.byColl = next
 	s.mu.Unlock()
 
-	return nil
+	return pending, nil
 }
 
 func (s *pluginState) configsForCollection(collectionName string) []ExtractPdfTextConfig {
@@ -308,6 +339,30 @@ func (s *pluginState) configsForCollection(collectionName string) []ExtractPdfTe
 	cloned := make([]ExtractPdfTextConfig, len(configs))
 	copy(cloned, configs)
 	return cloned
+}
+
+func (s *pluginState) tryStartRecalculation(rowID string, configIndex int) bool {
+	key := recalculationKey(rowID, configIndex)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.activeRecalculations[key]; ok {
+		return false
+	}
+
+	s.activeRecalculations[key] = struct{}{}
+	return true
+}
+
+func (s *pluginState) finishRecalculation(rowID string, configIndex int) {
+	s.mu.Lock()
+	delete(s.activeRecalculations, recalculationKey(rowID, configIndex))
+	s.mu.Unlock()
+}
+
+func recalculationKey(rowID string, configIndex int) string {
+	return fmt.Sprintf("%s:%d", rowID, configIndex)
 }
 
 func ensurePluginsCollection(app core.App) error {
@@ -382,6 +437,141 @@ func validateConfigShape(cfg ExtractPdfTextConfig) error {
 	}
 
 	return nil
+}
+
+func (p *Plugin) runRecalculation(app core.App, job pendingRecalculation) {
+	defer p.state.finishRecalculation(job.rowID, job.configIndex)
+
+	row, cfg, err := p.markConfigRecalculating(context.Background(), app, job)
+	if err != nil {
+		app.Logger().Error(
+			"pdf_text_extractor failed to start recalculation",
+			slog.String("configRecordId", job.rowID),
+			slog.Int("configIndex", job.configIndex),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	if err := p.recalculateCollection(context.Background(), app, cfg); err != nil {
+		app.Logger().Error(
+			"pdf_text_extractor recalculation failed",
+			slog.String("configRecordId", job.rowID),
+			slog.Int("configIndex", job.configIndex),
+			slog.String("collection", cfg.CollectionName),
+			slog.String("inputField", cfg.InputField),
+			slog.String("outputField", cfg.OutputField),
+			slog.Any("error", err),
+		)
+	}
+
+	if err := p.clearConfigRecalculating(context.Background(), app, row, job.configIndex); err != nil {
+		app.Logger().Error(
+			"pdf_text_extractor failed to finish recalculation",
+			slog.String("configRecordId", job.rowID),
+			slog.Int("configIndex", job.configIndex),
+			slog.Any("error", err),
+		)
+	}
+}
+
+func (p *Plugin) markConfigRecalculating(ctx context.Context, app core.App, job pendingRecalculation) (*core.Record, ExtractPdfTextConfig, error) {
+	row, err := app.FindRecordById(pluginsCollectionName, job.rowID)
+	if err != nil {
+		return nil, ExtractPdfTextConfig{}, err
+	}
+
+	configs, err := parsePluginConfigs(row)
+	if err != nil {
+		return nil, ExtractPdfTextConfig{}, err
+	}
+
+	if job.configIndex >= len(configs) {
+		return nil, ExtractPdfTextConfig{}, fmt.Errorf("config index %d out of range", job.configIndex)
+	}
+
+	cfg := configs[job.configIndex]
+	if !cfg.Recalculate && !cfg.Recalculating {
+		return row, cfg, nil
+	}
+
+	cfg.Recalculate = false
+	cfg.Recalculating = true
+	configs[job.configIndex] = cfg
+
+	if err := savePluginConfigs(ctx, app, row, configs); err != nil {
+		return nil, ExtractPdfTextConfig{}, err
+	}
+
+	return row, cfg, nil
+}
+
+func (p *Plugin) clearConfigRecalculating(ctx context.Context, app core.App, row *core.Record, configIndex int) error {
+	refreshed, err := app.FindRecordById(pluginsCollectionName, row.Id)
+	if err != nil {
+		return err
+	}
+
+	configs, err := parsePluginConfigs(refreshed)
+	if err != nil {
+		return err
+	}
+
+	if configIndex >= len(configs) {
+		return fmt.Errorf("config index %d out of range", configIndex)
+	}
+
+	configs[configIndex].Recalculating = false
+
+	return savePluginConfigs(ctx, app, refreshed, configs)
+}
+
+func savePluginConfigs(ctx context.Context, app core.App, row *core.Record, configs []ExtractPdfTextConfig) error {
+	raw, err := json.Marshal(configs)
+	if err != nil {
+		return fmt.Errorf("encode config json: %w", err)
+	}
+
+	row.Set(configField, types.JSONRaw(raw))
+	return app.SaveNoValidateWithContext(ctx, row)
+}
+
+func (p *Plugin) recalculateCollection(ctx context.Context, app core.App, cfg ExtractPdfTextConfig) error {
+	collection, err := app.FindCollectionByNameOrId(cfg.CollectionName)
+	if err != nil {
+		return err
+	}
+
+	offset := 0
+	for {
+		records, err := app.FindRecordsByFilter(collection, "", "id", recalculateBatchSize, offset)
+		if err != nil {
+			return err
+		}
+
+		if len(records) == 0 {
+			return nil
+		}
+
+		for _, record := range records {
+			if err := processRecord(ctx, app, cfg, record); err != nil {
+				app.Logger().Error(
+					"pdf_text_extractor batch recalculation failed for record",
+					slog.String("collection", cfg.CollectionName),
+					slog.String("recordId", record.Id),
+					slog.String("inputField", cfg.InputField),
+					slog.String("outputField", cfg.OutputField),
+					slog.Any("error", err),
+				)
+			}
+		}
+
+		if len(records) < recalculateBatchSize {
+			return nil
+		}
+
+		offset += len(records)
+	}
 }
 
 func validateConfigForCollection(cfg ExtractPdfTextConfig, collection *core.Collection) error {

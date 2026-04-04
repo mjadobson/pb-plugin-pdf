@@ -36,7 +36,8 @@ Example:
   {
     "collection_name": "docs",
     "input_field": "files",
-    "output_field": "files_text"
+    "output_field": "files_text",
+    "recalculate": true
   },
   {
     "collection_name": "invoices",
@@ -67,6 +68,16 @@ The file field containing one or more uploads.
 
 The text or editor field where extracted content should be stored.
 
+### `config[].recalculate`
+
+Optional one-off trigger. When set to `true`, the plugin will backfill all rows in the configured collection in batches of 100.
+
+As soon as the job starts, the plugin removes `recalculate` and sets `recalculating: true` for that config entry. When the job finishes, it removes `recalculating` too.
+
+### `config[].recalculating`
+
+Transient status flag managed by the plugin while a one-off recalculation is running. You should not set this manually.
+
 ## Behaviour
 
 - Empty input clears the output field.
@@ -76,6 +87,7 @@ The text or editor field where extracted content should be stored.
 - Extraction failures are logged and skipped so other files can still be processed.
 - Unrelated record updates do not re-parse PDFs; text is refreshed only when the configured file field changes.
 - Changing `_plugins` rows or relevant collection schemas takes effect for future create/update events without backfilling existing records.
+- Setting `recalculate: true` on a config entry triggers a one-off backfill for existing rows in that collection.
 
 ## Development
 
