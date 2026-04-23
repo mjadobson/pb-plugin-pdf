@@ -3,6 +3,7 @@
 Extract text from PDF files in PocketBase file fields and store the result in another field.
 
 The plugin supports multi-file fields, ignores non-PDF uploads, and merges multiple extracted PDFs with `---` separators.
+Text extraction is powered by `go-pdfium` running through the `wazero` WebAssembly backend, so there is no CGO requirement and no separate PDFium binary to install.
 
 ## Installation
 
@@ -99,6 +100,6 @@ GOCACHE=/tmp/go-build go build ./...
 
 ## License
 
-Licensed under the GNU Affero General Public License v3.0.
+Licensed under the MIT License.
 
-This plugin links against `github.com/moolekkari/unipdf`, which is AGPL-licensed, so the plugin is distributed under AGPLv3 as well. See [LICENSE](./LICENSE).
+This plugin uses `github.com/klippa-app/go-pdfium` with its `wazero` WebAssembly runtime. Those dependencies are MIT- and Apache-licensed respectively. See [LICENSE](./LICENSE).

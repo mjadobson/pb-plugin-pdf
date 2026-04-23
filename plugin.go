@@ -11,9 +11,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/moolekkari/unipdf/extractor"
-	pdf "github.com/moolekkari/unipdf/model"
+	"github.com/klippa-app/go-pdfium"
+	"github.com/klippa-app/go-pdfium/requests"
+	"github.com/klippa-app/go-pdfium/webassembly"
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/types"
@@ -30,6 +32,13 @@ const pluginNameField = "plugin_name"
 const configField = "config"
 const enabledField = "enabled"
 const recalculateBatchSize = 100
+const pdfiumAcquireTimeout = 60 * time.Second
+
+var (
+	pdfiumPoolOnce sync.Once
+	pdfiumPool     pdfium.Pool
+	pdfiumPoolErr  error
+)
 
 type ExtractPdfTextConfig struct {
 	CollectionName string `json:"collection_name"`
@@ -702,41 +711,77 @@ func updateOutputField(ctx context.Context, app core.App, record *core.Record, o
 }
 
 func pdfToText(inputPath string) (string, error) {
-	f, err := os.Open(inputPath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	pdfReader, err := pdf.NewPdfReader(f)
+	pool, err := getPDFiumPool()
 	if err != nil {
 		return "", err
 	}
 
-	numPages, err := pdfReader.GetNumPages()
+	instance, err := pool.GetInstance(pdfiumAcquireTimeout)
+	if err != nil {
+		return "", err
+	}
+	defer instance.Close()
+
+	file, err := os.Open(inputPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
 	if err != nil {
 		return "", err
 	}
 
-	texts := make([]string, 0, numPages)
-	for pageIndex := 1; pageIndex <= numPages; pageIndex++ {
-		page, err := pdfReader.GetPage(pageIndex)
-		if err != nil {
-			return "", err
-		}
+	doc, err := instance.OpenDocument(&requests.OpenDocument{
+		FileReader:     file,
+		FileReaderSize: fileInfo.Size(),
+	})
+	if err != nil {
+		return "", err
+	}
+	defer instance.FPDF_CloseDocument(&requests.FPDF_CloseDocument{
+		Document: doc.Document,
+	})
 
-		ex, err := extractor.New(page)
-		if err != nil {
-			return "", err
-		}
-
-		text, err := ex.ExtractText()
-		if err != nil {
-			return "", err
-		}
-
-		texts = append(texts, text)
+	pageCount, err := instance.FPDF_GetPageCount(&requests.FPDF_GetPageCount{
+		Document: doc.Document,
+	})
+	if err != nil {
+		return "", err
 	}
 
-	return strings.Join(texts, "\n"), nil
+	var builder strings.Builder
+	for pageIndex := 0; pageIndex < pageCount.PageCount; pageIndex++ {
+		pageText, err := instance.GetPageText(&requests.GetPageText{
+			Page: requests.Page{
+				ByIndex: &requests.PageByIndex{
+					Document: doc.Document,
+					Index:    pageIndex,
+				},
+			},
+		})
+		if err != nil {
+			return "", err
+		}
+
+		if pageIndex > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(pageText.Text)
+	}
+
+	return builder.String(), nil
+}
+
+func getPDFiumPool() (pdfium.Pool, error) {
+	pdfiumPoolOnce.Do(func() {
+		pdfiumPool, pdfiumPoolErr = webassembly.Init(webassembly.Config{
+			MinIdle:  1,
+			MaxIdle:  1,
+			MaxTotal: 1,
+		})
+	})
+
+	return pdfiumPool, pdfiumPoolErr
 }
